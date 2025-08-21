@@ -1,0 +1,205 @@
+#include <SoftwareSerial.h>
+
+// ---------------- CONFIG ----------------
+#define POT_PIN A0
+
+#define MASTER_TX 3   // Arduino TX → RS422 Master DI
+#define MASTER_RX 4   // Arduino RX ← RS422 Master RO
+#define SLAVE_TX  5   // Arduino TX → RS422 Slave DI
+#define SLAVE_RX  6   // Arduino RX ← RS422 Slave RO
+
+// If you have Arduino Mega/Leonardo with extra UARTs, replace with HardwareSerial
+SoftwareSerial MasterSerial(MASTER_RX, MASTER_TX); // RX, TX
+SoftwareSerial SlaveSerial(SLAVE_RX, SLAVE_TX);    // RX, TX
+
+// ---- Protocol markers ----
+#define STX   0x02
+#define ETX   0x03
+
+// ---- Node addressing ----
+#define MASTER_ADDR  0x00
+#define SLAVE_ADDR   0x01
+#define BROADCAST    0xFF
+
+// ---- Retry parameters ----
+#define MAX_RETRIES   3
+#define BASE_TIMEOUT  100   // ms
+
+// ---- Debug Toggle ----
+#define DEBUG 1
+#if DEBUG
+  #define DPRINT(x)   Serial.print(x)
+  #define DPRINTLN(x) Serial.println(x)
+#else
+  #define DPRINT(x)
+  #define DPRINTLN(x)
+#endif
+
+// ---- Error Counters ----
+uint16_t successCount = 0;
+uint16_t errorTimeout = 0;
+uint16_t errorChecksum = 0;
+uint16_t errorUnknown  = 0;
+
+// ---------------- Frame struct ----------------
+struct Frame {
+  uint8_t addr;
+  uint8_t len;
+  uint8_t data[32];
+  uint8_t checksum;
+};
+
+// ---------------- Checksum ----------------
+uint8_t calcChecksum(const Frame &f) {
+  uint8_t chk = f.addr ^ f.len;
+  for (uint8_t i = 0; i < f.len; i++) chk ^= f.data[i];
+  return chk;
+}
+
+// ---------------- Low-level I/O ----------------
+void sendByte(Stream &s, uint8_t b) {
+  s.write(b);
+}
+
+bool readByteWithTimeout(Stream &s, uint8_t &b, unsigned long timeout) {
+  unsigned long start = millis();
+  while (!s.available()) {
+    if (millis() - start > timeout) return false;
+  }
+  b = s.read();
+  return true;
+}
+
+// ---------------- Frame send ----------------
+void sendFrame(Stream &s, const Frame &f) {
+  sendByte(s, STX);
+  sendByte(s, f.addr);
+  sendByte(s, f.len);
+  for (uint8_t i = 0; i < f.len; i++) sendByte(s, f.data[i]);
+  sendByte(s, f.checksum);
+  sendByte(s, ETX);
+}
+
+// ---------------- Frame receive ----------------
+bool readFrame(Stream &s, Frame &f, unsigned long timeout) {
+  uint8_t b;
+
+  // Wait for STX
+  if (!readByteWithTimeout(s, b, timeout)) { errorTimeout++; return false; }
+  if (b != STX) { errorUnknown++; return false; }
+
+  // Address
+  if (!readByteWithTimeout(s, f.addr, timeout)) { errorTimeout++; return false; }
+
+  // Length
+  if (!readByteWithTimeout(s, f.len, timeout)) { errorTimeout++; return false; }
+  if (f.len > 32) { errorUnknown++; return false; }
+
+  // Payload
+  for (uint8_t i = 0; i < f.len; i++) {
+    if (!readByteWithTimeout(s, f.data[i], timeout)) { errorTimeout++; return false; }
+  }
+
+  // Checksum
+  if (!readByteWithTimeout(s, f.checksum, timeout)) { errorTimeout++; return false; }
+
+  // ETX
+  if (!readByteWithTimeout(s, b, timeout)) { errorTimeout++; return false; }
+  if (b != ETX) { errorUnknown++; return false; }
+
+  // Verify checksum
+  if (f.checksum != calcChecksum(f)) { errorChecksum++; return false; }
+
+  return true;
+}
+
+// ---------------- ACK/NACK ----------------
+void sendAck(Stream &s, uint8_t dest) {
+  Frame f;
+  f.addr = dest;
+  f.len = 1;
+  f.data[0] = 0x06;  // ACK code
+  f.checksum = calcChecksum(f);
+  sendFrame(s, f);
+}
+
+void sendNack(Stream &s, uint8_t dest) {
+  Frame f;
+  f.addr = dest;
+  f.len = 1;
+  f.data[0] = 0x15;  // NACK code
+  f.checksum = calcChecksum(f);
+  sendFrame(s, f);
+}
+
+// ---------------- Master: send with retries ----------------
+bool sendWithAck(uint8_t destAddr, uint8_t *data, uint8_t len) {
+  Frame f;
+  f.addr = destAddr;
+  f.len = len;
+  for (uint8_t i = 0; i < len; i++) f.data[i] = data[i];
+  f.checksum = calcChecksum(f);
+
+  for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    sendFrame(MasterSerial, f);
+
+    Frame resp;
+    unsigned long adaptiveTimeout = BASE_TIMEOUT * (attempt + 1);
+
+    if (readFrame(MasterSerial, resp, adaptiveTimeout)) {
+      if (resp.addr == destAddr && resp.len == 1 && resp.data[0] == 0x06) {
+        DPRINTLN("Master: ACK received");
+        successCount++;
+        return true;
+      } else if (resp.len == 1 && resp.data[0] == 0x15) {
+        DPRINTLN("Master: NACK received → retrying");
+      }
+    } else {
+      DPRINTLN("Master: Timeout or error → retrying");
+    }
+  }
+  return false;
+}
+
+// =========================================================
+void setup() {
+  Serial.begin(9600);        // Debug to PC
+  MasterSerial.begin(9600);  // RS-422 Master side
+  SlaveSerial.begin(9600);   // RS-422 Slave side
+
+  Serial.println("RS-422 Protocol Test Started");
+}
+
+void loop() {
+  // === Master role ===
+  int potValue = analogRead(POT_PIN);
+  uint8_t scaled = potValue / 4;
+  uint8_t payload[2] = {scaled, (uint8_t)(scaled ^ 0xFF)}; // demo data
+
+  DPRINT("Master sending: "); 
+  DPRINTLN(scaled);
+
+  if (!sendWithAck(SLAVE_ADDR, payload, 2)) {
+    DPRINTLN("Master: Failed after retries!");
+  }
+
+  delay(200);
+
+  // === Slave role ===
+  Frame rxFrame;
+  if (readFrame(SlaveSerial, rxFrame, BASE_TIMEOUT)) {
+    if (rxFrame.addr == MASTER_ADDR || rxFrame.addr == BROADCAST) {
+      DPRINT("Slave got frame from "); DPRINT(rxFrame.addr);
+      DPRINT(" [len="); DPRINT(rxFrame.len); DPRINT("]: ");
+      for (uint8_t i = 0; i < rxFrame.len; i++) { DPRINT(rxFrame.data[i]); DPRINT(" "); }
+      DPRINTLN();
+
+      // Send ACK back
+      sendAck(SlaveSerial, rxFrame.addr);
+    } else {
+      sendNack(SlaveSerial, rxFrame.addr);
+    }
+  }
+
+  delay(1000);
+}
