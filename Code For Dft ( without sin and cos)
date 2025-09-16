@@ -1,0 +1,85 @@
+#include <math.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
+
+#define FS 1000.0f
+#define N 64
+
+void platform_init(void);
+float read_adc_sample(void);
+void uart_send(const char *s);
+
+void dft_compute(const float x[], float Xre[], float Xim[]) {
+    for (int k = 0; k < N; ++k) {
+        float angle = -2.0f * M_PI * k / (float)N;
+        float w_re = cosf(angle);
+        float w_im = sinf(angle);
+        float w_n_re = 1.0f;
+        float w_n_im = 0.0f;
+        float sumRe = 0.0f, sumIm = 0.0f;
+        for (int n = 0; n < N; ++n) {
+            sumRe += x[n] * w_n_re;
+            sumIm += x[n] * w_n_im;
+            float next_re = w_n_re * w_re - w_n_im * w_im;
+            float next_im = w_n_re * w_im + w_n_im * w_re;
+            w_n_re = next_re;
+            w_n_im = next_im;
+        }
+        Xre[k] = sumRe;
+        Xim[k] = sumIm;
+    }
+}
+
+static int find_dominant_bin_from_complex(const float re[], const float im[]) {
+    int maxIdx = 1;
+    float maxMag = 0.0f;
+    int half = N / 2;
+    for (int k = 1; k < half; ++k) {
+        float mag = re[k]*re[k] + im[k]*im[k];
+        if (mag > maxMag) {
+            maxMag = mag;
+            maxIdx = k;
+        }
+    }
+    return maxIdx;
+}
+
+int main(void) {
+    platform_init();
+    float samples[N];
+    float Xre[N];
+    float Xim[N];
+    char msg[80];
+    while (1) {
+        for (int i = 0; i < N; ++i) {
+            samples[i] = read_adc_sample();
+        }
+        dft_compute(samples, Xre, Xim);
+        int bin = find_dominant_bin_from_complex(Xre, Xim);
+        float freq = ((float)bin * FS) / (float)N;
+        int len = sprintf(msg, "Dominant: %0.3f Hz (bin %d)\r\n", freq, bin);
+        (void)len;
+        uart_send(msg);
+    }
+    return 0;
+}
+
+#ifdef TEST_DESKTOP
+#include <time.h>
+static float test_phase = 0.0f;
+void platform_init(void) { srand((unsigned)time(NULL)); }
+float read_adc_sample(void) {
+    float f0 = 60.0f;
+    float noise = ((float)rand() / RAND_MAX - 0.5f) * 0.5f;
+    float s = sinf(2.0f * M_PI * f0 * test_phase / FS) + noise;
+    test_phase += 1.0f;
+    return s;
+}
+void uart_send(const char *s) { fputs(s, stdout); fflush(stdout); }
+#endif
